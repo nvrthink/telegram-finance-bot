@@ -10,9 +10,9 @@ import google.generativeai as genai
 app = FastAPI()
 
 # Configuration from Environment Variables
-BOT_TOKEN = os.getenv("8891247016:AAEcUF0VSzpsd-eqz2IjXNYKuvaYxMzQ5JM")
-DATABASE_URL = os.getenv("postgresql://neondb_owner:npg_3kdVCz2Fjbth@ep-snowy-hall-aybkcw8s-pooler.c-5.us-east-2.aws.neon.tech/telegram-finance-bot?sslmode=require&channel_binding=require")
-GEMINI_API_KEY = os.getenv("AQ.Ab8RN6Iro9KTc1Zh5t3IZZEEGJLgPsdAbPxI5Y906cwjhwIWvg")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
