@@ -3,5 +3,5 @@ uvicorn
 httpx
 psycopg2-binary
 pydantic
-google-generativeai
+google-genai
 pillow

@@ -5,7 +5,7 @@ import psycopg2
 import httpx
 from PIL import Image
 from fastapi import FastAPI, Request
-import google.generativeai as genai
+from google import genai
 
 app = FastAPI()
 
@@ -16,9 +16,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Initialize Gemini AI
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 def get_db():
@@ -52,14 +51,13 @@ def init_db():
         print("Database Init Error:", e)
 
 
-# Run DB initialization
 init_db()
 
 
 async def send_message(chat_id: int, text: str):
     """Send text response to Telegram user"""
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    async with httpx.AsyncClient() as http_client:
+        await http_client.post(
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         )
@@ -67,17 +65,18 @@ async def send_message(chat_id: int, text: str):
 
 async def get_telegram_file_bytes(file_id: str) -> bytes:
     """Download image file from Telegram servers"""
-    async with httpx.AsyncClient() as client:
-        res = await client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
+    async with httpx.AsyncClient() as http_client:
+        res = await http_client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
         file_path = res.json()["result"]["file_path"]
         download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        file_res = await client.get(download_url)
+        file_res = await http_client.get(download_url)
         return file_res.content
 
 
 def parse_with_gemini_text(user_text: str) -> list:
     """Parse text using Gemini AI into structured transaction JSON"""
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or not client:
+        print("Error: GEMINI_API_KEY belum terpasang!")
         return []
 
     prompt = f"""
@@ -103,18 +102,25 @@ def parse_with_gemini_text(user_text: str) -> list:
     """
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(cleaned_text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        text_resp = response.text.strip()
+        if "```" in text_resp:
+            text_resp = text_resp.split("```")[1]
+            if text_resp.startswith("json"):
+                text_resp = text_resp[4:]
+        return json.loads(text_resp.strip())
     except Exception as e:
-        print("Gemini Text Error:", e)
+        print("Gemini Text Exception Detail:", e)
         return []
 
 
 def parse_with_gemini_vision(image_bytes: bytes) -> list:
     """Parse photo receipt using Gemini Vision OCR"""
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or not client:
+        print("Error: GEMINI_API_KEY belum terpasang!")
         return []
 
     prompt = """
@@ -137,12 +143,18 @@ def parse_with_gemini_vision(image_bytes: bytes) -> list:
 
     try:
         image = Image.open(io.BytesIO(image_bytes))
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([prompt, image])
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(cleaned_text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[image, prompt],
+        )
+        text_resp = response.text.strip()
+        if "```" in text_resp:
+            text_resp = text_resp.split("```")[1]
+            if text_resp.startswith("json"):
+                text_resp = text_resp[4:]
+        return json.loads(text_resp.strip())
     except Exception as e:
-        print("Gemini Vision Error:", e)
+        print("Gemini Vision Exception Detail:", e)
         return []
 
 
@@ -216,7 +228,6 @@ async def telegram_webhook(request: Request):
         message = data["message"]
         chat_id = message["chat"]["id"]
 
-        # 1. Handle Commands & Text Messages
         if "text" in message:
             text = message["text"].strip()
 
@@ -231,16 +242,13 @@ async def telegram_webhook(request: Request):
             elif text == "/rekap":
                 reply = get_rekap(chat_id)
             else:
-                # Process with Gemini NLP
                 transactions = parse_with_gemini_text(text)
                 reply = save_transactions(chat_id, transactions)
 
             await send_message(chat_id, reply)
 
-        # 2. Handle Receipt Photo Uploads (OCR)
         elif "photo" in message:
             await send_message(chat_id, "🔍 *Menganalisis foto struk dengan AI...*")
-            # Take the highest resolution photo (last element)
             photo_file_id = message["photo"][-1]["file_id"]
             img_bytes = await get_telegram_file_bytes(photo_file_id)
             
