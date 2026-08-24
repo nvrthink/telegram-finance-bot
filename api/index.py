@@ -97,7 +97,7 @@ async def get_telegram_file_bytes(file_id: str) -> bytes:
         return file_res.content
 
 
-# --- Gemini Parsing Logic ---
+# --- Gemini AI Integration ---
 
 def parse_with_gemini_text(user_text: str) -> list:
     """Parse text using Gemini AI into structured transaction JSON"""
@@ -202,7 +202,6 @@ def save_transactions(user_id: int, transactions: list):
         category = item.get("category", "Umum")
         desc = item.get("description", "-")
 
-        # Save and return inserted ID
         cur.execute(
             "INSERT INTO transactions (user_id, type, amount, category, description) VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (user_id, t_type, amount, category, desc)
@@ -212,7 +211,6 @@ def save_transactions(user_id: int, transactions: list):
         icon = "📤 Pengeluaran" if t_type == "EXPENSE" else "📥 Pemasukan"
         saved_summary.append(f"{icon}: *Rp {amount:,.0f}*\n🏷️ Kategori: {category}\n📝 Ket: {desc}")
 
-        # Add delete button for each transaction
         short_desc = desc[:12] if len(desc) > 12 else desc
         keyboard_buttons.append([
             {"text": f"❌ Hapus: {short_desc} (Rp {amount:,.0f})", "callback_data": f"delete_{inserted_id}"}
@@ -268,6 +266,48 @@ def delete_last_transaction(user_id: int) -> str:
         return f"❌ Gagal membatalkan transaksi: {e}"
 
 
+def update_last_transaction_amount(user_id: int, new_amount_text: str) -> str:
+    """Update amount for the most recent transaction of the user"""
+    parsed = parse_with_gemini_text(f"transaksi {new_amount_text}")
+    if not parsed or "amount" not in parsed[0]:
+        return "❌ Nominal baru tidak valid. Contoh penggunaan: `/revisi 25rb` atau `/revisi 25000`"
+
+    new_amount = parsed[0]["amount"]
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE transactions 
+            SET amount = %s 
+            WHERE id = (
+                SELECT id FROM transactions 
+                WHERE user_id = %s 
+                ORDER BY created_at DESC, id DESC LIMIT 1
+            )
+            RETURNING category, description;
+            """,
+            (new_amount, user_id)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return "ℹ️ Tidak ada transaksi terakhir yang ditemukan untuk diperbarui."
+
+        category, desc = row
+        return (
+            "✏️ *Nominal Berhasil Diperbarui!*\n"
+            f"📝 *{desc}* ({category})\n"
+            f"💰 Nominal Baru: *Rp {new_amount:,.0f}*"
+        )
+    except Exception as e:
+        return f"❌ Gagal memperbarui nominal: {e}"
+
+
 def get_rekap(user_id: int) -> str:
     """Calculate totals and balance from database"""
     try:
@@ -296,7 +336,47 @@ def get_rekap(user_id: int) -> str:
         return f"❌ Gagal mengambil data rekap: {e}"
 
 
-# --- Webhook Handler ---
+def get_riwayat(user_id: int) -> str:
+    """Fetch 5 most recent transactions from database"""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT type, amount, category, description, created_at 
+            FROM transactions 
+            WHERE user_id = %s 
+            ORDER BY created_at DESC 
+            LIMIT 5
+            """, 
+            (user_id,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not rows:
+            return "ℹ️ Belum ada transaksi yang dicatat."
+
+        pesan = "📜 *5 Transaksi Terakhir Kamu:*\n\n"
+        
+        for row in rows:
+            t_type, amount, category, desc, created_at = row
+            icon = "📤" if t_type == "EXPENSE" else "📥"
+            tanggal = created_at.strftime("%d-%m-%Y %H:%M")
+            
+            pesan += f"{icon} *Rp {amount:,.0f}* ({category})\n"
+            pesan += f"📝 {desc}\n"
+            pesan += f"📅 {tanggal}\n"
+            pesan += "-----------------------------------\n"
+            
+        return pesan
+    except Exception as e:
+        return f"❌ Gagal mengambil riwayat transaksi: {e}"
+
+
+# --- Main Webhook Handler ---
 
 @app.post("/")
 @app.post("/api/index")
@@ -339,10 +419,20 @@ async def telegram_webhook(request: Request):
                         "👋 *Selamat datang di Bot Catatan Keuangan AI!*\n\n"
                         "Kamu bisa mencatat keuangan secara alami tanpa command kaku:\n"
                         "• *Ketik Santai:* `Tadi makan siang nasi padang 25rb`\n"
-                        "• *Kirim Foto Struk:* Cukup kirimkan foto struk belanjaanmu!\n"
-                        "• *Batal Transaksi:* Gunakan `/batal` atau tombol hapus di konfirmasi.\n"
-                        "• *Cek Rekap:* Ketik `/rekap` untuk melihat sisa saldo."
+                        "• *Kirim Foto Struk:* Kirimkan foto struk belanjaanmu!\n"
+                        "• *Revisi Nominal:* `/revisi 25rb` (mengubah nominal terakhir)\n"
+                        "• *Batal Transaksi:* `/batal` atau tekan tombol hapus.\n"
+                        "• *Lihat Riwayat:* `/riwayat` (5 transaksi terakhir)\n"
+                        "• *Cek Rekap:* `/rekap` (sisa saldo & total)"
                     )
+                    await send_message(chat_id, reply)
+
+                elif text.startswith("/revisi"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) > 1:
+                        reply = update_last_transaction_amount(chat_id, parts[1])
+                    else:
+                        reply = "⚠️ Masukkan nominal baru. Contoh: `/revisi 25rb` atau `/revisi 25000`"
                     await send_message(chat_id, reply)
 
                 elif text in ["/batal", "/undo"]:
@@ -351,6 +441,10 @@ async def telegram_webhook(request: Request):
 
                 elif text == "/rekap":
                     reply = get_rekap(chat_id)
+                    await send_message(chat_id, reply)
+
+                elif text == "/riwayat":
+                    reply = get_riwayat(chat_id)
                     await send_message(chat_id, reply)
 
                 else:
