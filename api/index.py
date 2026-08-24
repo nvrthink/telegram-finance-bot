@@ -103,7 +103,7 @@ def parse_with_gemini_text(user_text: str) -> list:
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
         )
         text_resp = response.text.strip()
@@ -144,7 +144,7 @@ def parse_with_gemini_vision(image_bytes: bytes) -> list:
     try:
         image = Image.open(io.BytesIO(image_bytes))
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=[image, prompt],
         )
         text_resp = response.text.strip()
