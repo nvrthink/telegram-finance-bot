@@ -54,13 +54,37 @@ def init_db():
 init_db()
 
 
-async def send_message(chat_id: int, text: str):
-    """Send text response to Telegram user"""
+# --- Telegram API Helpers ---
+
+async def send_message(chat_id: int, text: str, reply_markup: dict = None):
+    """Send text response to Telegram user with optional inline buttons"""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     async with httpx.AsyncClient() as http_client:
-        await http_client.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        )
+        await http_client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+
+
+async def edit_message_text(chat_id: int, message_id: int, text: str):
+    """Edit existing Telegram message text"""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    async with httpx.AsyncClient() as http_client:
+        await http_client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
+
+
+async def answer_callback_query(callback_query_id: str, text: str = None):
+    """Acknowledge Telegram button click"""
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    async with httpx.AsyncClient() as http_client:
+        await http_client.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload)
 
 
 async def get_telegram_file_bytes(file_id: str) -> bytes:
@@ -72,6 +96,8 @@ async def get_telegram_file_bytes(file_id: str) -> bytes:
         file_res = await http_client.get(download_url)
         return file_res.content
 
+
+# --- Gemini Parsing Logic ---
 
 def parse_with_gemini_text(user_text: str) -> list:
     """Parse text using Gemini AI into structured transaction JSON"""
@@ -158,14 +184,17 @@ def parse_with_gemini_vision(image_bytes: bytes) -> list:
         return []
 
 
-def save_transactions(user_id: int, transactions: list) -> str:
-    """Save extracted transactions to Neon Postgres DB"""
+# --- Database CRUD Operations ---
+
+def save_transactions(user_id: int, transactions: list):
+    """Save extracted transactions to Neon Postgres DB and build Inline Keyboard"""
     if not transactions:
-        return "❌ Gagal memproses transaksi. Pastikan format teks atau foto jelas."
+        return "❌ Gagal memproses transaksi. Pastikan format teks atau foto jelas.", None
 
     conn = get_db()
     cur = conn.cursor()
     saved_summary = []
+    keyboard_buttons = []
 
     for item in transactions:
         t_type = item.get("type", "EXPENSE")
@@ -173,19 +202,70 @@ def save_transactions(user_id: int, transactions: list) -> str:
         category = item.get("category", "Umum")
         desc = item.get("description", "-")
 
+        # Save and return inserted ID
         cur.execute(
-            "INSERT INTO transactions (user_id, type, amount, category, description) VALUES (%s, %s, %s, %s, %s)",
+            "INSERT INTO transactions (user_id, type, amount, category, description) VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (user_id, t_type, amount, category, desc)
         )
-        
+        inserted_id = cur.fetchone()[0]
+
         icon = "📤 Pengeluaran" if t_type == "EXPENSE" else "📥 Pemasukan"
         saved_summary.append(f"{icon}: *Rp {amount:,.0f}*\n🏷️ Kategori: {category}\n📝 Ket: {desc}")
+
+        # Add delete button for each transaction
+        short_desc = desc[:12] if len(desc) > 12 else desc
+        keyboard_buttons.append([
+            {"text": f"❌ Hapus: {short_desc} (Rp {amount:,.0f})", "callback_data": f"delete_{inserted_id}"}
+        ])
 
     conn.commit()
     cur.close()
     conn.close()
 
-    return "✅ *Berhasil Dicatat via AI!*\n\n" + "\n\n".join(saved_summary)
+    reply_markup = {"inline_keyboard": keyboard_buttons} if keyboard_buttons else None
+    return "✅ *Berhasil Dicatat via AI!*\n\n" + "\n\n".join(saved_summary), reply_markup
+
+
+def delete_transaction_by_id(user_id: int, tx_id: int) -> bool:
+    """Delete a specific transaction by ID for a user"""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM transactions WHERE id = %s AND user_id = %s", (tx_id, user_id))
+        deleted_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted_count > 0
+    except Exception as e:
+        print("Delete Tx Error:", e)
+        return False
+
+
+def delete_last_transaction(user_id: int) -> str:
+    """Delete the single most recent transaction of the user"""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, amount, category, description FROM transactions WHERE user_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return "ℹ️ Tidak ada transaksi terakhir yang ditemukan untuk dibatalkan."
+
+        tx_id, amount, category, desc = row
+        cur.execute("DELETE FROM transactions WHERE id = %s AND user_id = %s", (tx_id, user_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return f"🗑️ *Transaksi Terakhir Berhasil Dibatalkan!*\n💰 *Rp {amount:,.0f}* ({category} - {desc})"
+    except Exception as e:
+        return f"❌ Gagal membatalkan transaksi: {e}"
 
 
 def get_rekap(user_id: int) -> str:
@@ -216,45 +296,76 @@ def get_rekap(user_id: int) -> str:
         return f"❌ Gagal mengambil data rekap: {e}"
 
 
+# --- Webhook Handler ---
+
 @app.post("/")
 @app.post("/api/index")
 async def telegram_webhook(request: Request):
     """Main Webhook Handler for Telegram"""
     try:
         data = await request.json()
-        if "message" not in data:
+
+        # 1. Handle Inline Button Clicks (Callback Queries)
+        if "callback_query" in data:
+            cb = data["callback_query"]
+            cb_id = cb["id"]
+            user_id = cb["from"]["id"]
+            chat_id = cb["message"]["chat"]["id"]
+            message_id = cb["message"]["message_id"]
+            cb_data = cb.get("data", "")
+
+            if cb_data.startswith("delete_"):
+                tx_id = int(cb_data.split("_")[1])
+                success = delete_transaction_by_id(user_id, tx_id)
+
+                if success:
+                    await answer_callback_query(cb_id, "✅ Transaksi berhasil dihapus!")
+                    await edit_message_text(chat_id, message_id, "❌ *[TRANSAKSI DIHAPUS]* Transaksi ini telah dibatalkan.")
+                else:
+                    await answer_callback_query(cb_id, "⚠️ Transaksi gagal dihapus atau sudah tidak ada.")
+
             return {"status": "ok"}
 
-        message = data["message"]
-        chat_id = message["chat"]["id"]
+        # 2. Handle Text Messages & Photo Uploads
+        if "message" in data:
+            message = data["message"]
+            chat_id = message["chat"]["id"]
 
-        if "text" in message:
-            text = message["text"].strip()
+            if "text" in message:
+                text = message["text"].strip()
 
-            if text == "/start":
-                reply = (
-                    "👋 *Selamat datang di Bot Catatan Keuangan AI!*\n\n"
-                    "Kamu bisa mencatat keuangan secara alami tanpa command kaku:\n"
-                    "• *Ketik Santai:* `Tadi makan siang nasi padang 25rb sama naik gojek 15k`\n"
-                    "• *Kirim Foto Struk:* Cukup kirimkan foto struk belanjaanmu!\n"
-                    "• *Cek Rekap:* Ketik `/rekap` untuk melihat sisa saldo."
-                )
-            elif text == "/rekap":
-                reply = get_rekap(chat_id)
-            else:
-                transactions = parse_with_gemini_text(text)
-                reply = save_transactions(chat_id, transactions)
+                if text == "/start":
+                    reply = (
+                        "👋 *Selamat datang di Bot Catatan Keuangan AI!*\n\n"
+                        "Kamu bisa mencatat keuangan secara alami tanpa command kaku:\n"
+                        "• *Ketik Santai:* `Tadi makan siang nasi padang 25rb`\n"
+                        "• *Kirim Foto Struk:* Cukup kirimkan foto struk belanjaanmu!\n"
+                        "• *Batal Transaksi:* Gunakan `/batal` atau tombol hapus di konfirmasi.\n"
+                        "• *Cek Rekap:* Ketik `/rekap` untuk melihat sisa saldo."
+                    )
+                    await send_message(chat_id, reply)
 
-            await send_message(chat_id, reply)
+                elif text in ["/batal", "/undo"]:
+                    reply = delete_last_transaction(chat_id)
+                    await send_message(chat_id, reply)
 
-        elif "photo" in message:
-            await send_message(chat_id, "🔍 *Menganalisis foto struk dengan AI...*")
-            photo_file_id = message["photo"][-1]["file_id"]
-            img_bytes = await get_telegram_file_bytes(photo_file_id)
-            
-            transactions = parse_with_gemini_vision(img_bytes)
-            reply = save_transactions(chat_id, transactions)
-            await send_message(chat_id, reply)
+                elif text == "/rekap":
+                    reply = get_rekap(chat_id)
+                    await send_message(chat_id, reply)
+
+                else:
+                    transactions = parse_with_gemini_text(text)
+                    reply, markup = save_transactions(chat_id, transactions)
+                    await send_message(chat_id, reply, reply_markup=markup)
+
+            elif "photo" in message:
+                await send_message(chat_id, "🔍 *Menganalisis foto struk dengan AI...*")
+                photo_file_id = message["photo"][-1]["file_id"]
+                img_bytes = await get_telegram_file_bytes(photo_file_id)
+
+                transactions = parse_with_gemini_vision(img_bytes)
+                reply, markup = save_transactions(chat_id, transactions)
+                await send_message(chat_id, reply, reply_markup=markup)
 
     except Exception as e:
         print("Webhook Error:", e)
